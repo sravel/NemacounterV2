@@ -138,17 +138,6 @@ class NemaCounterGUI:
         model_menu = CTK.CTkOptionMenu(master=modelspath_frame, values=model_files, variable=self.model_var)
         model_menu.grid(row=1, column=0, padx=20, pady=(10, 10))
 
-        fpath_conf = 'conf/config.ini'
-        if os.path.exists(fpath_conf):
-            config = common.get_config_info(os.path.abspath(fpath_conf))
-            self.sam2_checkpoint_path = os.path.relpath(config['Models']['sam2_model_checkpoint_path'])
-            self.sam2_config_path = os.path.relpath(config['Models']['sam2_model_config_path'])
-
-        else:
-            message = "No configuration file found"
-            tk.messagebox.showwarning("Warning", message)
-            sys.exit()
-
     def start_detection(self, indir_var, outdir_var, projid_entry, confslid_var, overslid_var, add_overlay_var,
                         show_bbox_var, show_conf_var, show_mask_var):
         if not self.model_var.get():
@@ -392,8 +381,6 @@ class NemaCounterGUI:
                     input_file=fpath_globinfo,
                     output_directory=dpath_outdir,
                     project_id=project_id,
-                    sam_model_checkpoint=self.sam2_checkpoint_path,
-                    sam_model_config=self.sam2_config_path,
                     use_gpu=self.use_GPU.get()
                 )
                 messagebox.showinfo("Success", "Manual edition process completed successfully.")
@@ -460,8 +447,6 @@ class NemaCounterGUI:
         dct_var_segmentation = {
             'input_file': infile_var.get(),
             'add_overlay': add_overlay_var.get(),
-            'segany': self.sam2_checkpoint_path,
-            'sam2_config': self.sam2_config_path,
             'gpu': self.use_GPU.get(),
             'cpu': self.nb_wanted_cpu.get()
         }

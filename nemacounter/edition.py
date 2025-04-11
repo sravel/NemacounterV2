@@ -312,7 +312,7 @@ def build_annotations_dataframe(annotations, img_path):
     df = pd.DataFrame(records)
     return df
 
-def edition_workflow(input_file, output_directory, project_id, sam_model_checkpoint, sam_model_config, use_gpu):
+def edition_workflow(input_file, output_directory, project_id,  use_gpu):
     global sam_predictor, device, img_height_orig, img_width_orig, input_size
     if use_gpu == 0:
         device = 'cpu'
