@@ -46,9 +46,9 @@ class NemaCounterDetection:
             half = True
         else:
             half = False
-
+        img = cv2.imread(img_path)
         results = self.custom_model.predict(
-            source=img_path,
+            source=img,
             imgsz=input_size,
             conf=self.conf_thresh,
             iou=self.iou_thresh,
