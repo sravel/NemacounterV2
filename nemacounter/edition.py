@@ -20,7 +20,7 @@ from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QPointF, QRectF,
                           QTimer, QEvent, QPoint, QObject, pyqtSlot)
 from PyQt6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen,
                          QBrush, QPolygonF, QIcon, QKeySequence, QFont,
-                         QTransform, QCursor, QPainterPath, QKeyEvent)
+                         QTransform, QCursor, QPainterPath, QKeyEvent, QShortcut, QActionGroup)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QListWidget, QListWidgetItem, QGraphicsScene,
@@ -2857,8 +2857,8 @@ def edition_workflow(input_file, output_directory, project_id, use_gpu=True, inp
     app.setStyle('Fusion')
 
     # Set dark palette for better visibility
-    from PyQt5.QtGui import QPalette
-    from PyQt5.QtCore import Qt
+    from PyQt6.QtGui import QPalette
+    from PyQt6.QtCore import Qt
 
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(53, 53, 53))

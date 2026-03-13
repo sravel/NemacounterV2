@@ -1,7 +1,7 @@
 
 
 from nemacounter.argsparsers import segmentation_argument_parser
-from nemacounter.segmentation import segmentation_workflow
+from nemacounter.detection_engine import segmentation_workflow
 
 
     

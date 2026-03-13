@@ -1,5 +1,5 @@
 from nemacounter.argsparsers import detection_argument_parser
-from nemacounter.detection import detection_workflow
+from nemacounter.detection_engine import detection_workflow
 
 
 if __name__=="__main__":
