@@ -16,23 +16,23 @@ from dataclasses import dataclass
 from copy import deepcopy
 import gc
 
-from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QPointF, QRectF,
+from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QPointF, QRectF,
                           QTimer, QEvent, QPoint, QObject, pyqtSlot)
-from PyQt5.QtGui import (QImage, QPixmap, QPainter, QColor, QPen,
+from PyQt6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen,
                          QBrush, QPolygonF, QIcon, QKeySequence, QFont,
                          QTransform, QCursor, QPainterPath, QKeyEvent)
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget,
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QListWidget, QListWidgetItem, QGraphicsScene,
                              QGraphicsView, QGraphicsItem, QGraphicsPolygonItem,
                              QGraphicsRectItem, QGraphicsEllipseItem,
-                             QToolBar, QAction, QDockWidget, QMessageBox,
+                             QToolBar, QDockWidget, QMessageBox,
                              QFileDialog, QProgressBar, QStatusBar, QSlider,
                              QSpinBox, QGroupBox, QCheckBox, QComboBox,
-                             QSplitter, QMenu, QActionGroup, QDialog,
+                             QSplitter, QMenu, QDialog,
                              QDialogButtonBox, QGridLayout, QGraphicsPixmapItem,
                              QGraphicsPathItem, QGraphicsProxyWidget,
-                             QShortcut, QInputDialog)
+                             QInputDialog)
 
 try:
     from sam2.sam2_image_predictor import SAM2ImagePredictor
