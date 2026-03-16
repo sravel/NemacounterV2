@@ -1,21 +1,11 @@
-"""
-NemaCounter GUI — PyQt6 + Napari  (v2 — mode Projet)
-=====================================================
-Nouvelle architecture centrée sur un répertoire de travail :
-
-  1. Sidebar  → sélection projet + scan auto + info modèle live
-  2. Onglet Overview   → tableau de bord du projet (images / résultats existants)
-  3. Onglet Run        → paramètres + lancement unique (détection OU segmentation)
-  4. Onglet Edition    → visualisation / correction Napari
-  5. Onglet Export     → conversion Roboflow JSON
-
-Les méthodes marquées # TODO sont à compléter pour les workflows internes.
-"""
-
 import sys
 import os
 import json
 import csv
+import logging
+from pathlib import Path
+
+log = logging.getLogger("LYRA.gui")
 
 import numpy as np
 import pandas as pd
@@ -39,7 +29,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QProgressBar, QLineEdit, QComboBox,
     QFrame, QMessageBox, QScrollArea, QGroupBox,
     QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTextEdit, QSplitter,
+    QTextEdit, QSplitter, QRadioButton,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QPixmap, QFont, QIcon, QColor
@@ -47,14 +37,14 @@ from PyQt6.QtGui import QPixmap, QFont, QIcon, QColor
 # ── Napari ────────────────────────────────────────────────────────────────────
 import napari
 
-# ── Modules NemaCounter ───────────────────────────────────────────────────────
-import nemacounter.utils as utils
-import nemacounter.common as common
+# ── Modules LYRA ───────────────────────────────────────────────────────
+import lyra.utils as utils
+import lyra.common as common
 # detection_workflow et edition_workflow sont importés localement dans RunWorker
 # pour éviter de charger torch/ultralytics au démarrage de l'UI
-from nemacounter.detection_engine import (
-    NemaCounterDetection,
-    NemaCounterSegmentation,
+from lyra.detection_engine import (
+    LYRADetection,
+    LYRASegmentation,
     add_masks_on_image,
     create_multicolored_masks_image,
 )
@@ -96,7 +86,18 @@ class ModelProbeWorker(QThread):
 
 
 class ProjectScanWorker(QThread):
-    """Scanne le répertoire de travail et retourne les stats du projet."""
+    """
+    Scanne le répertoire de travail et retourne les stats complètes du projet.
+
+    Résultat émis (dict) :
+      images       : [chemin absolu, ...]  — images source (top-level)
+      glob_csvs    : [...]  — *_globinfo.csv (détection YOLO)
+      seg_csvs     : [...]  — *_segmentation_globinfo.csv (SAM)
+      edit_csvs    : [...]  — *_edition_globinfo.csv (édition manuelle)
+      json_exports : [...]  — *_roboflow_coco.json
+      yolo_exports : [...]  — data.yaml (dataset YOLO train)
+      img_info     : {basename: {yolo, sam, edition, exported}}
+    """
     done = pyqtSignal(dict)
 
     def __init__(self, work_dir: str):
@@ -104,30 +105,106 @@ class ProjectScanWorker(QThread):
         self.work_dir = work_dir
 
     def run(self):
-        result = {"images": [], "glob_csvs": [], "seg_csvs": []}
+        result = {
+            "images": [], "glob_csvs": [], "seg_csvs": [],
+            "edit_csvs": [], "json_exports": [], "yolo_exports": [],
+        }
 
-        # ── Images : top-level uniquement (pas de sous-dossiers) ─────────
-        # Évite de ramasser les overlays produits dans MyProject/img/masks/
+        # ── Images top-level ─────────────────────────────────────────────
         for f in sorted(os.listdir(self.work_dir)):
             full = os.path.join(self.work_dir, f)
-            if os.path.isfile(full):
-                ext = os.path.splitext(f)[1].lower()
-                if ext in IMG_EXTENSIONS:
-                    result["images"].append(full)
+            if os.path.isfile(full) and os.path.splitext(f)[1].lower() in IMG_EXTENSIONS:
+                result["images"].append(full)
 
-        # ── CSVs : sous-dossiers uniquement (dossiers résultats) ─────────
+        # ── Sous-dossiers résultats ───────────────────────────────────────
         for root, dirs, files in os.walk(self.work_dir):
-            if root == self.work_dir:          # ignorer la racine pour les CSV
+            if root == self.work_dir:
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 continue
             dirs[:] = [d for d in dirs if d != "img"]
             for f in files:
                 full = os.path.join(root, f)
-                if f.endswith(CSV_SEG_SUFFIX):
+                if f.endswith("_edition_globinfo.csv"):
+                    result["edit_csvs"].append(full)
+                elif f.endswith(CSV_SEG_SUFFIX):
                     result["seg_csvs"].append(full)
                 elif f.endswith(CSV_GLOB_SUFFIX):
                     result["glob_csvs"].append(full)
+                elif f.endswith("_roboflow_coco.json"):
+                    result["json_exports"].append(full)
+                elif f == "data.yaml":
+                    result["yolo_exports"].append(full)
 
+        # ── Agréger les infos par image ───────────────────────────────────
+        img_info: dict[str, dict] = {}
+
+        def _ensure(bn):
+            if bn not in img_info:
+                img_info[bn] = {
+                    "yolo": None, "sam": None, "edition": None,
+                    "exported": {"json": False, "yolo": False},
+                    "full_path": "",
+                }
+
+        def _read_csv_counts(paths, key, extra_fn=None):
+            for p in paths:
+                try:
+                    df = pd.read_csv(p, comment="#", usecols=["img_id", "object_type"])
+                    real = df[df["object_type"].notna() & (df["object_type"] != "")]
+                    for img_id, grp in real.groupby("img_id"):
+                        bn = os.path.basename(str(img_id))
+                        _ensure(bn)
+                        entry = {"count": len(grp), "csv_path": p}
+                        if extra_fn:
+                            extra_fn(entry, grp)
+                        img_info[bn][key] = entry
+                except Exception:
+                    pass
+
+        def _yolo_extra(entry, grp):
+            types = grp["object_type"].unique()
+            entry["type"] = "mask" if "mask" in types else "box"
+
+        _read_csv_counts(result["glob_csvs"],  "yolo",    _yolo_extra)
+        _read_csv_counts(result["seg_csvs"],   "sam")
+        _read_csv_counts(result["edit_csvs"],  "edition")
+
+        # Diff édition vs référence
+        for bn, info in img_info.items():
+            if info["edition"] and (info["yolo"] or info["sam"]):
+                ref = (info["sam"] or info["yolo"])["count"]
+                info["edition"]["diff"] = info["edition"]["count"] - ref
+
+        # ── Export per-CSV stem (précis, pas global) ──────────────────────
+        # Construire un index stem → fichier d'export
+        json_stems: set[str] = set()
+        for jp in result["json_exports"]:
+            stem = os.path.basename(jp).replace("_roboflow_coco.json", "")
+            json_stems.add(stem)
+
+        yolo_proj_dirs: set[str] = set()
+        for yp in result["yolo_exports"]:
+            yolo_proj_dirs.add(os.path.dirname(os.path.dirname(yp)))  # remonter au-dessus de labels/
+
+        for bn, info in img_info.items():
+            for key in ("yolo", "sam", "edition"):
+                if info[key]:
+                    csv_path = info[key].get("csv_path", "")
+                    # Récupérer le stem du CSV qui contient cette image
+                    csv_stem = os.path.basename(csv_path).replace("_globinfo.csv","")                                                           .replace("_segmentation_globinfo.csv","")                                                           .replace("_edition_globinfo.csv","")
+                    if csv_stem in json_stems:
+                        info["exported"]["json"] = True
+                    csv_dir = os.path.dirname(csv_path)
+                    if any(csv_dir.startswith(d) or d.startswith(csv_dir) for d in yolo_proj_dirs):
+                        info["exported"]["yolo"] = True
+
+        # Attacher le chemin complet de l'image
+        for p in result["images"]:
+            bn = os.path.basename(p)
+            _ensure(bn)
+            img_info[bn]["full_path"] = p
+
+        result["img_info"] = img_info
         self.done.emit(result)
 
 
@@ -153,8 +230,8 @@ class RunWorker(QThread):
                 self._run_detection()
             elif self.mode == "segmentation":
                 self._run_segmentation()
-            elif self.mode == "edition":
-                self._run_edition()
+            else:
+                raise ValueError(f"Unknown run mode: {self.mode!r}")
             self.finished.emit(True, f"{self.mode.capitalize()} completed successfully.")
         except MemoryError:
             self.finished.emit(False, "Failed: insufficient memory.")
@@ -173,7 +250,7 @@ class RunWorker(QThread):
           log_callback      → signal log     (str)
         Toute la logique de boucle, sauvegarde CSV, overlay est dans detection.py.
         """
-        from nemacounter.detection_engine import detection_workflow
+        from lyra.detection_engine import detection_workflow
         detection_workflow(
             self.params,
             gui=True,
@@ -183,7 +260,7 @@ class RunWorker(QThread):
         )
 
     def _run_segmentation(self):
-        from nemacounter.detection_engine import segmentation_workflow
+        from lyra.detection_engine import segmentation_workflow
         segmentation_workflow(
             self.params,
             progress_callback=self.progress.emit,
@@ -193,37 +270,84 @@ class RunWorker(QThread):
     # _run_edition is no longer used — EditionWindow opens directly in main thread
 
 
-class ExportWorker(QThread):
-    """Convertit un _globinfo.csv en JSON COCO Roboflow."""
+class _MetricsWorker(QThread):
+    """
+    Background worker for the enhanced metrics report.
+    Calls export_engine.export_metrics_report() and emits progress/status/finished.
+    """
     progress = pyqtSignal(float)
     status   = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, globinfo_path: str):
+    def __init__(self, globinfo_path: str, selected_groups: list,
+                 image_paths: dict | None = None):
         super().__init__()
-        self.path = globinfo_path
+        self.path            = globinfo_path
+        self.selected_groups = selected_groups
+        self.image_paths     = image_paths
+
+    def run(self):
+        try:
+            from lyra.export_engine import export_metrics_report
+            result = export_metrics_report(
+                self.path,
+                selected_groups=self.selected_groups,
+                image_paths=self.image_paths,
+                progress_callback=self.progress.emit,
+                status_callback=self.status.emit,
+            )
+            summary = os.path.basename(result["summary"])
+            agg     = os.path.basename(result["aggregate"])
+            self.finished.emit(True, f"Saved: {summary}  +  {agg}")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.finished.emit(False, str(e))
+
+
+class ExportWorker(QThread):
+    """Convertit un _globinfo.csv en JSON Roboflow COCO ou en dataset YOLO train."""
+    progress = pyqtSignal(float)
+    status   = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, globinfo_path: str, format: str = "roboflow",
+                 output_dir: str = "",
+                 train_pct: int = 70, val_pct: int = 15, test_pct: int = 15):
+        super().__init__()
+        self.path       = globinfo_path
+        self.format     = format
+        self.output_dir = output_dir
+        self.train_pct  = train_pct
+        self.val_pct    = val_pct
+        self.test_pct   = test_pct
 
     def run(self):
         try:
             self._convert()
-            self.finished.emit(True, "JSON exported successfully.")
+            label = "JSON" if self.format == "roboflow" else "YOLO dataset"
+            self.finished.emit(True, f"{label} exported successfully.")
         except Exception as e:
             import traceback; traceback.print_exc()
             self.finished.emit(False, str(e))
 
     def _convert(self):
-        # TODO: Transcrire ici convert_to_roboflow_json() de l'ancienne GUI
-        #
-        # Étapes :
-        #   1. Lire "# input_directory:" du CSV
-        #   2. pd.read_csv(..., comment='#')
-        #   3. Construire coco_json = {images:[], annotations:[], categories:[]}
-        #   4. Pour chaque groupe img_id :
-        #        - box     → entry bbox COCO [x,y,w,h]
-        #        - mask/polygon → segmentation COCO + bbox depuis contours
-        #   5. json.dump vers <globinfo_stem>_roboflow_coco.json
-        #   6. Émettre self.progress(x) et self.status("...")
-        raise NotImplementedError("Export Roboflow à implémenter.")
+        from lyra.export_engine import export_roboflow_coco, export_yolo_train
+        if self.format == "yolo":
+            export_yolo_train(
+                self.path,
+                self.output_dir,
+                train_pct=self.train_pct,
+                val_pct=self.val_pct,
+                test_pct=self.test_pct,
+                progress_callback=self.progress.emit,
+                status_callback=self.status.emit,
+            )
+        else:
+            export_roboflow_coco(
+                self.path,
+                progress_callback=self.progress.emit,
+                status_callback=self.status.emit,
+            )
 
 
 # =============================================================================
@@ -284,6 +408,188 @@ class LabeledSlider(QWidget):
         self._sld.setValue(int(v / self._scale))
 
 
+class RangeSlider(QWidget):
+    """
+    Slider à deux poignées sur une seule piste — style range selector.
+
+    Valeurs :
+      lo  = position de la poignée gauche  (0..100, défaut 70)  → % train
+      hi  = position de la poignée droite  (0..100, défaut 85)  → % train+val
+
+    Segments colorés :
+      [0..lo]    bleu   → train
+      [lo..hi]   vert   → val  (obligatoire, min 1 image si N > 0)
+      [hi..100]  rouge  → test (optionnel, peut être 0)
+
+    Signaux :
+      changed(lo, hi)  émis à chaque déplacement
+    """
+    changed = pyqtSignal(int, int)   # lo, hi  (0-100)
+
+    _TRACK_H = 6
+    _HANDLE_R = 9   # rayon poignée
+    _MIN_VAL  = 1   # val minimum = 1 % (arrondi à 1 image si N > 0)
+
+    # Couleurs segments
+    _COL_TRAIN = "#378ADD"
+    _COL_VAL   = "#3B6D11"
+    _COL_TEST  = "#D85A30"
+    _COL_TRACK = "#45475a"
+    _COL_HANDLE = "#ffffff"
+    _COL_HANDLE_BORDER = "#888"
+
+    def __init__(self, lo=70, hi=85, parent=None):
+        super().__init__(parent)
+        self._lo = max(0, min(99, lo))
+        self._hi = max(self._lo + self._MIN_VAL, min(100, hi))
+        self._drag: str | None = None   # "lo" | "hi" | None
+        self.setMinimumHeight(36)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    # ── Accesseurs ────────────────────────────────────────────────────────────
+
+    @property
+    def lo(self) -> int: return self._lo
+
+    @property
+    def hi(self) -> int: return self._hi
+
+    def set_values(self, lo: int, hi: int):
+        lo = max(0, min(99, lo))
+        hi = max(lo + self._MIN_VAL, min(100, hi))
+        changed = (lo != self._lo or hi != self._hi)
+        self._lo, self._hi = lo, hi
+        self.update()
+        if changed:
+            self.changed.emit(self._lo, self._hi)
+
+    # ── Géométrie ─────────────────────────────────────────────────────────────
+
+    def _track_rect(self):
+        """Retourne (x_start, x_end, y_center) de la piste."""
+        m = self._HANDLE_R + 2
+        w = self.width() - 2 * m
+        y = self.height() // 2
+        return m, m + w, y
+
+    def _val_to_x(self, v: int) -> int:
+        x0, x1, _ = self._track_rect()
+        return round(x0 + (x1 - x0) * v / 100)
+
+    def _x_to_val(self, x: int) -> int:
+        x0, x1, _ = self._track_rect()
+        v = round((x - x0) / max(1, x1 - x0) * 100)
+        return max(0, min(100, v))
+
+    # ── Rendu ─────────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        x0, x1, yc = self._track_rect()
+        h = self._TRACK_H
+        r_track = h // 2
+
+        x_lo = self._val_to_x(self._lo)
+        x_hi = self._val_to_x(self._hi)
+
+        # ── Piste de fond ─────────────────────────────────────────────────
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self._COL_TRACK))
+        p.drawRoundedRect(x0, yc - h//2, x1 - x0, h, r_track, r_track)
+
+        # ── Segment Train (bleu) ──────────────────────────────────────────
+        if x_lo > x0:
+            p.setBrush(QColor(self._COL_TRAIN))
+            p.drawRoundedRect(x0, yc - h//2, x_lo - x0, h, r_track, r_track)
+
+        # ── Segment Val (vert) ────────────────────────────────────────────
+        if x_hi > x_lo:
+            p.setBrush(QColor(self._COL_VAL))
+            p.drawRect(x_lo, yc - h//2, x_hi - x_lo, h)
+
+        # ── Segment Test (rouge) ──────────────────────────────────────────
+        if x1 > x_hi:
+            p.setBrush(QColor(self._COL_TEST))
+            p.drawRoundedRect(x_hi, yc - h//2, x1 - x_hi, h, r_track, r_track)
+
+        # ── Poignée Lo ────────────────────────────────────────────────────
+        self._draw_handle(p, x_lo, yc)
+        # ── Poignée Hi ────────────────────────────────────────────────────
+        self._draw_handle(p, x_hi, yc)
+
+        p.end()
+
+    def _draw_handle(self, p, x, y):
+        from PyQt6.QtGui import QColor, QPen
+        r = self._HANDLE_R
+        p.setPen(QPen(QColor(self._COL_HANDLE_BORDER), 1.5))
+        p.setBrush(QColor(self._COL_HANDLE))
+        p.drawEllipse(x - r, y - r, 2*r, 2*r)
+
+    # ── Interactions ──────────────────────────────────────────────────────────
+
+    def _hit(self, pos) -> str | None:
+        x_lo = self._val_to_x(self._lo)
+        x_hi = self._val_to_x(self._hi)
+        yc   = self.height() // 2
+        r    = self._HANDLE_R + 4
+        dx_lo = abs(pos.x() - x_lo)
+        dx_hi = abs(pos.x() - x_hi)
+        dy    = abs(pos.y() - yc)
+        if dy > r * 2:
+            return None
+        if dx_lo < dx_hi and dx_lo <= r:
+            return "lo"
+        if dx_hi <= dx_lo and dx_hi <= r:
+            return "hi"
+        # Zone de la piste → déplacer la poignée la plus proche
+        if dx_lo <= r:
+            return "lo"
+        if dx_hi <= r:
+            return "hi"
+        return None
+
+    def mousePressEvent(self, event):
+        self._drag = self._hit(event.pos())
+        if self._drag:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._move_handle(event.pos().x())
+
+    def mouseMoveEvent(self, event):
+        if self._drag:
+            self._move_handle(event.pos().x())
+        else:
+            hit = self._hit(event.pos())
+            self.setCursor(
+                Qt.CursorShape.SizeHorCursor if hit
+                else Qt.CursorShape.ArrowCursor
+            )
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _move_handle(self, x: int):
+        v = self._x_to_val(x)
+        if self._drag == "lo":
+            # Train peut aller de 0 à hi - MIN_VAL (val doit garder au moins MIN_VAL)
+            new_lo = max(0, min(v, self._hi - self._MIN_VAL))
+            if new_lo != self._lo:
+                self._lo = new_lo
+                self.update()
+                self.changed.emit(self._lo, self._hi)
+        elif self._drag == "hi":
+            # Hi = train+val peut aller de lo+MIN_VAL à 100
+            new_hi = max(self._lo + self._MIN_VAL, min(v, 100))
+            if new_hi != self._hi:
+                self._hi = new_hi
+                self.update()
+                self.changed.emit(self._lo, self._hi)
+
+
 class InfoCard(QGroupBox):
     """Carte d'information clé/valeur."""
     def __init__(self, title: str, rows: list = None, parent=None):
@@ -328,11 +634,11 @@ def section_lbl(text: str) -> QLabel:
 #  FENÊTRE PRINCIPALE
 # =============================================================================
 
-class NemaCounterGUI(QMainWindow):
+class LYRAApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NemaCounter  ·  PyQt6 & Napari")
+        self.setWindowTitle("LYRA  ·  Laboratory YOLO Recognition & Analysis")
         self.resize(1280, 800)
 
         # ── État ──────────────────────────────────────────────────────────
@@ -368,7 +674,7 @@ class NemaCounterGUI(QMainWindow):
     def _build_sidebar(self) -> QFrame:
         sb = QFrame()
         sb.setObjectName("sidebar")
-        sb.setFixedWidth(265)
+        sb.setFixedWidth(365)
         lay = QVBoxLayout(sb)
         lay.setContentsMargins(14, 18, 14, 18)
         lay.setSpacing(10)
@@ -378,13 +684,13 @@ class NemaCounterGUI(QMainWindow):
         pix_path = os.path.join("conf", "logo.png")
         if os.path.exists(pix_path):
             pix = QPixmap(pix_path).scaled(
-                200, 110,
+                300, 110,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             logo.setPixmap(pix)
         else:
-            logo.setText("NemaCounter")
+            logo.setText("LYRA")
             logo.setFont(QFont("Arial", 16, QFont.Weight.Bold))
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(logo)
@@ -491,73 +797,262 @@ class NemaCounterGUI(QMainWindow):
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(24, 20, 24, 20)
-        lay.setSpacing(14)
+        lay.setSpacing(12)
 
-        # Titre + bouton scan
+        # ── Titre + bouton scan ───────────────────────────────────────────
         top = QHBoxLayout()
-        self._ov_title = QLabel("No project loaded — open a folder to start")
+        self._ov_title = QLabel("Aucun projet chargé — sélectionnez un dossier pour commencer")
         self._ov_title.setObjectName("pageTitle")
         self._ov_title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         top.addWidget(self._ov_title)
         top.addStretch()
-        self._scan_btn = QPushButton("↻  Scan / Refresh")
+        self._scan_btn = QPushButton("↻  Scan / Rafraîchir")
         self._scan_btn.setObjectName("actionBtn")
         self._scan_btn.setEnabled(False)
         self._scan_btn.clicked.connect(self._scan_project)
         top.addWidget(self._scan_btn)
         lay.addLayout(top)
 
-        # Cartes de statistiques
-        cards = QHBoxLayout()
-        cards.setSpacing(12)
-        self._stat_images   = self._make_stat_card("Images found",      "0", "#89b4fa")
-        self._stat_det_csv  = self._make_stat_card("Detection CSVs",    "0", "#a6e3a1")
-        self._stat_seg_csv  = self._make_stat_card("Segmentation CSVs", "0", "#f9e2af")
-        for c in (self._stat_images, self._stat_det_csv, self._stat_seg_csv):
-            cards.addWidget(c)
-        lay.addLayout(cards)
-
-        # Splitter : table images | table CSVs
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
-        img_box = QGroupBox("Images in working directory")
-        img_lay = QVBoxLayout(img_box)
-        self._img_table = QTableWidget(0, 5)
-        self._img_table.setHorizontalHeaderLabels(
-            ["Filename", "YOLO", "SAM", "Status", "Ext"]
+        # ── Pipeline visuel (funnel) ──────────────────────────────────────
+        # 5 étapes : Images → Détection → SAM → Édition → Exporté
+        pipe_frame = QFrame()
+        pipe_frame.setStyleSheet(
+            "QFrame { background: transparent; }"
+            "QLabel#pipeCount { font-size: 18px; font-weight: bold; }"
+            "QLabel#pipeLabel { font-size: 10px; }"
         )
-        self._img_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._img_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._img_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._img_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._img_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        pipe_lay = QHBoxLayout(pipe_frame)
+        pipe_lay.setSpacing(0)
+        pipe_lay.setContentsMargins(0, 0, 0, 0)
+
+        self._pipe_steps: list[tuple[QLabel, QLabel]] = []
+        steps = [
+            ("Images",     "#89b4fa"),
+            ("Détection",  "#a6e3a1"),
+            ("SAM",        "#cba6f7"),
+            ("Édition",    "#f5c2e7"),
+            ("Exporté",    "#f9e2af"),
+        ]
+        for i, (label, color) in enumerate(steps):
+            cell = QWidget()
+            cl = QVBoxLayout(cell)
+            cl.setContentsMargins(8, 6, 8, 6)
+            cl.setSpacing(2)
+            cl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            val_lbl = QLabel("—")
+            val_lbl.setObjectName("pipeCount")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val_lbl.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: bold;")
+
+            pct_lbl = QLabel("0 %")
+            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pct_lbl.setStyleSheet("color: #888; font-size: 10px;")
+
+            txt_lbl = QLabel(label)
+            txt_lbl.setObjectName("pipeLabel")
+            txt_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            txt_lbl.setStyleSheet("color: #888; font-size: 10px; text-transform: uppercase;")
+
+            cl.addWidget(val_lbl)
+            cl.addWidget(pct_lbl)
+            cl.addWidget(txt_lbl)
+
+            cell.setStyleSheet(
+                f"QWidget {{ border-left: 3px solid {color}; "
+                f"background: transparent; border-radius: 0; }}"
+            )
+            pipe_lay.addWidget(cell, 1)
+            self._pipe_steps.append((val_lbl, pct_lbl))
+
+            if i < len(steps) - 1:
+                arr = QLabel("›")
+                arr.setStyleSheet("color: #555; font-size: 20px; padding: 0 4px;")
+                arr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pipe_lay.addWidget(arr)
+
+        lay.addWidget(pipe_frame)
+
+        # ── Légende ───────────────────────────────────────────────────────
+        legend = QHBoxLayout()
+        legend.setSpacing(14)
+        for dot, txt in [
+            ("#6c7086", "⬜ En attente"),
+            ("#89b4fa", "🔲 Détection"),
+            ("#a6e3a1", "🎭 YOLO masks"),
+            ("#cba6f7", "✏  SAM"),
+            ("#f5c2e7", "📝 Édition"),
+            ("#f9e2af", "📤 Exporté"),
+        ]:
+            lbl = QLabel(txt)
+            lbl.setStyleSheet(f"color: {dot}; font-size: 11px;")
+            legend.addWidget(lbl)
+        legend.addStretch()
+        lay.addLayout(legend)
+
+        # ── Splitter principal (table images | panneau détail) ────────────
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # ── Bloc images ───────────────────────────────────────────────────
+        img_box = QGroupBox("Images dans le dossier de travail")
+        img_lay = QVBoxLayout(img_box)
+
+        # Barre de filtre + actions
+        flt_row = QHBoxLayout()
+        flt_row.addWidget(QLabel("Filtrer :"))
+        self._img_filter = QComboBox()
+        self._img_filter.addItems([
+            "Toutes", "En attente", "Détection", "SAM", "Édition", "Exportées"
+        ])
+        self._img_filter.setFixedWidth(140)
+        self._img_filter.currentIndexChanged.connect(self._apply_img_filter)
+        flt_row.addWidget(self._img_filter)
+        flt_row.addStretch()
+
+        self._ov_run_pending_btn = QPushButton("▶  Lancer sur sélection")
+        self._ov_run_pending_btn.setObjectName("actionBtn")
+        self._ov_run_pending_btn.setEnabled(False)
+        self._ov_run_pending_btn.setToolTip("Bascule sur Run avec le dossier actuel")
+        self._ov_run_pending_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        flt_row.addWidget(self._ov_run_pending_btn)
+
+        self._ov_open_edit_btn = QPushButton("✏  Ouvrir dans Édition")
+        self._ov_open_edit_btn.setObjectName("actionBtn")
+        self._ov_open_edit_btn.setEnabled(False)
+        self._ov_open_edit_btn.clicked.connect(self._ov_open_in_edition)
+        flt_row.addWidget(self._ov_open_edit_btn)
+        img_lay.addLayout(flt_row)
+
+        # Splitter horizontal : table | thumbnail+info
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Table images
+        # Colonnes : Fichier | YOLO | SAM | Édition | Δ | Export | Statut | Ext
+        self._img_table = QTableWidget(0, 8)
+        self._img_table.setHorizontalHeaderLabels(
+            ["Fichier", "YOLO", "SAM", "Édition", "Δ ann.", "Export", "Statut", "Ext"]
+        )
+        hh = self._img_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3, 4, 5, 6, 7):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self._img_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._img_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._img_table.setAlternatingRowColors(True)
-        img_lay.addWidget(self._img_table)
-        splitter.addWidget(img_box)
+        self._img_table.itemSelectionChanged.connect(self._on_img_selection_changed)
+        self._img_table.cellDoubleClicked.connect(self._on_img_double_clicked)
+        h_splitter.addWidget(self._img_table)
 
-        csv_box = QGroupBox("Results")
-        csv_lay = QVBoxLayout(csv_box)
-        self._csv_table = QTableWidget(0, 5)
-        self._csv_table.setHorizontalHeaderLabels(
-            ["Filename", "Type", "Images", "Objects", "Path"]
+        # Panneau détail (thumbnail + toggle avant/après + annotations)
+        detail_panel = QWidget()
+        detail_panel.setMinimumWidth(240)
+        detail_panel.setMaximumWidth(360)
+        dp_lay = QVBoxLayout(detail_panel)
+        dp_lay.setContentsMargins(8, 4, 4, 4)
+        dp_lay.setSpacing(4)
+
+        # ── Boutons de comparaison avant/après ────────────────────────────
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(2)
+        self._thumb_mode_btns: dict[str, QPushButton] = {}
+        for mode, label, tip in [
+            ("raw",     "Original",  "Image brute sans annotation"),
+            ("yolo",    "YOLO",      "Annotations YOLO (détection ou segmentation)"),
+            ("sam",     "SAM",       "Masques SAM"),
+            ("edition", "Édition",   "Annotations manuelles (édition)"),
+        ]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(22)
+            btn.setEnabled(False)
+            btn.setStyleSheet(
+                "QPushButton{font-size:10px;padding:0 4px;border-radius:3px;"
+                "background:#313244;color:#888;border:1px solid #45475a;}"
+                "QPushButton:checked{background:#1e66f5;color:#fff;border-color:#1e66f5;}"
+                "QPushButton:enabled:!checked:hover{background:#45475a;color:#cdd6f4;}"
+                "QPushButton:disabled{color:#555;background:#1e1e2e;}"
+            )
+            btn.clicked.connect(lambda checked, m=mode: self._set_thumb_mode(m))
+            self._thumb_mode_btns[mode] = btn
+            toggle_row.addWidget(btn)
+        dp_lay.addLayout(toggle_row)
+
+        self._thumb_lbl = QLabel()
+        self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb_lbl.setMinimumHeight(170)
+        self._thumb_lbl.setStyleSheet(
+            "QLabel { background: #181825; border: 1px solid #313244; border-radius: 4px; }"
         )
-        self._csv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._csv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._csv_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._csv_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._csv_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self._thumb_lbl.setText("Sélectionnez\nune image")
+        dp_lay.addWidget(self._thumb_lbl)
+
+        # Infos sur l'image sélectionnée
+        self._detail_card = InfoCard("Détails", [
+            ("Fichier",   "—"),
+            ("Dimensions","—"),
+            ("YOLO",      "—"),
+            ("SAM",       "—"),
+            ("Édition",   "—"),
+            ("Δ ann.",    "—"),
+            ("Export",    "—"),
+            ("CSV source","—"),
+            ("Modifié",   "—"),
+        ])
+        dp_lay.addWidget(self._detail_card)
+
+        # Boutons d'action rapide pour l'image sélectionnée
+        action_row = QHBoxLayout()
+        action_row.setSpacing(4)
+        self._ov_quick_edit_btn   = QPushButton("✏  Éditer")
+        self._ov_quick_export_btn = QPushButton("📤  Exporter")
+        for b in (self._ov_quick_edit_btn, self._ov_quick_export_btn):
+            b.setFixedHeight(26)
+            b.setEnabled(False)
+            b.setObjectName("actionBtn")
+            b.setStyleSheet(b.styleSheet() + "QPushButton{font-size:11px;}")
+        self._ov_quick_edit_btn.clicked.connect(self._ov_open_in_edition)
+        self._ov_quick_export_btn.clicked.connect(self._ov_quick_export)
+        action_row.addWidget(self._ov_quick_edit_btn)
+        action_row.addWidget(self._ov_quick_export_btn)
+        dp_lay.addLayout(action_row)
+        dp_lay.addStretch()
+        h_splitter.addWidget(detail_panel)
+
+        # État interne du panneau détail
+        self._thumb_current_rd:   dict | None = None  # row_data courant
+        self._thumb_current_mode: str         = "raw"
+
+        h_splitter.setSizes([680, 260])
+        img_lay.addWidget(h_splitter)
+        main_splitter.addWidget(img_box)
+
+        # ── Bloc résultats / CSVs ─────────────────────────────────────────
+        res_box = QGroupBox("Résultats & exports")
+        res_lay = QVBoxLayout(res_box)
+
+        # Colonnes : Fichier | Type | Images | Objets | Classes | → JSON | → YOLO | Date | Chemin
+        self._csv_table = QTableWidget(0, 9)
+        self._csv_table.setHorizontalHeaderLabels(
+            ["Fichier", "Type", "Images", "Objets", "Classes", "→ JSON", "→ YOLO", "Modifié", "Chemin"]
+        )
+        hh2 = self._csv_table.horizontalHeader()
+        hh2.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3, 4, 5, 6, 7):
+            hh2.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        hh2.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         self._csv_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._csv_table.setAlternatingRowColors(True)
-        # Double-click CSV → auto-fill Edition/Export
         self._csv_table.cellDoubleClicked.connect(self._on_csv_double_clicked)
-        csv_lay.addWidget(self._csv_table)
-        splitter.addWidget(csv_box)
+        res_lay.addWidget(self._csv_table)
+        main_splitter.addWidget(res_box)
 
-        splitter.setSizes([420, 200])
-        lay.addWidget(splitter, 1)
+        main_splitter.setSizes([460, 200])
+        lay.addWidget(main_splitter, 1)
+
+        # Buffer pour le filtre
+        self._img_all_rows: list[dict] = []
         return tab
+
 
     # ─────────────────────────────────────────────────────────────────────────
     #  TAB 1 — RUN (detection / segmentation)
@@ -843,32 +1338,200 @@ class NemaCounterGUI(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_export_tab(self) -> QWidget:
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
+        """
+        Export tab — two independent sections:
+          1. Annotation export  (Roboflow COCO JSON or YOLO train dataset)
+          2. Metrics report     (configurable summary + aggregate CSVs)
+
+        Both sections share the same CSV source selector at the top.
+        """
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
         lay.setContentsMargins(24, 20, 24, 20)
-        lay.setSpacing(14)
+        lay.setSpacing(16)
 
-        lay.addWidget(QLabel(
-            "Convert a *_globinfo.csv to Roboflow COCO JSON.\n"
-            "CSVs detected during project scan are listed below — or browse manually."
-        ))
+        # ═════════════════════════════════════════════════════════════════════
+        #  CSV SOURCE  (shared by both sections)
+        # ═════════════════════════════════════════════════════════════════════
+        src_box = QGroupBox("Source CSV")
+        src_lay = QVBoxLayout(src_box)
 
-        quick_box = QGroupBox("Quick select (from last scan)")
-        quick_lay = QVBoxLayout(quick_box)
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("From scan:"))
         self._exp_csv_combo = QComboBox()
-        self._exp_csv_combo.addItem("(no scan result)")
-        quick_lay.addWidget(self._exp_csv_combo)
-        lay.addWidget(quick_box)
+        self._exp_csv_combo.addItem("(no scan yet)")
+        self._exp_csv_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        src_row.addWidget(self._exp_csv_combo, 1)
+        src_lay.addLayout(src_row)
 
-        man_box = QGroupBox("Or browse manually")
-        man_lay = QVBoxLayout(man_box)
+        browse_row = QHBoxLayout()
+        browse_row.addWidget(QLabel("Or browse:"))
         self._exp_csv_row = PathRow("Browse CSV …", "(no file selected)")
         self._exp_csv_row.btn.clicked.connect(
             lambda: self._pick_globinfo(self._exp_csv_row)
         )
-        man_lay.addWidget(self._exp_csv_row)
-        lay.addWidget(man_box)
+        browse_row.addWidget(self._exp_csv_row, 1)
+        src_lay.addLayout(browse_row)
+        lay.addWidget(src_box)
 
+        # ═════════════════════════════════════════════════════════════════════
+        #  SECTION 1 — ANNOTATION EXPORT
+        # ═════════════════════════════════════════════════════════════════════
+        ann_box = QGroupBox("1 — Annotation export")
+        ann_box.setStyleSheet(
+            "QGroupBox { border-left: 3px solid #378ADD; border-radius: 0; "
+            "margin-top: 12px; padding: 10px 8px 8px 12px; }"
+            "QGroupBox::title { color: #378ADD; }"
+        )
+        ann_lay = QVBoxLayout(ann_box)
+
+        # Format radio
+        fmt_row = QHBoxLayout()
+        self._exp_fmt_roboflow = QRadioButton(
+            "Roboflow COCO JSON"
+        )
+        self._exp_fmt_roboflow.setToolTip(
+            "Produces a single *_roboflow_coco.json file.\n"
+            "Compatible with direct upload to Roboflow."
+        )
+        self._exp_fmt_yolo = QRadioButton(
+            "YOLO train dataset"
+        )
+        self._exp_fmt_yolo.setToolTip(
+            "Produces images/ + labels/ folders and data.yaml.\n"
+            "Use directly with: yolo train data=data.yaml"
+        )
+        self._exp_fmt_roboflow.setChecked(True)
+        fmt_row.addWidget(self._exp_fmt_roboflow)
+        fmt_row.addWidget(self._exp_fmt_yolo)
+        fmt_row.addStretch()
+        ann_lay.addLayout(fmt_row)
+
+        # YOLO output folder (hidden in Roboflow mode)
+        self._exp_yolo_out = PathRow("Output folder …", "(required for YOLO dataset)")
+        self._exp_yolo_out.btn.clicked.connect(lambda: self._pick_dir(self._exp_yolo_out))
+        self._exp_yolo_out.setEnabled(False)
+        self._exp_yolo_out.setVisible(False)
+        ann_lay.addWidget(self._exp_yolo_out)
+
+        # Train/val/test split (hidden in Roboflow mode)
+        self._yolo_split_box = QGroupBox("Train / Val / Test split")
+        sv = QVBoxLayout(self._yolo_split_box)
+        self._yolo_split_box.setVisible(False)
+
+        legend_row = QHBoxLayout()
+        legend_row.setSpacing(16)
+        for color, text in [
+            (RangeSlider._COL_TRAIN, "■ Train"),
+            (RangeSlider._COL_VAL,   "■ Val  (required, min 1%)"),
+            (RangeSlider._COL_TEST,  "■ Test  (optional)"),
+        ]:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"color:{color};font-size:11px;font-weight:500;")
+            legend_row.addWidget(lbl)
+        legend_row.addStretch()
+        sv.addLayout(legend_row)
+
+        self._range_slider = RangeSlider(lo=70, hi=85)
+        self._range_slider.setFixedHeight(38)
+        sv.addWidget(self._range_slider)
+
+        self._split_summary = QLabel("")
+        self._split_summary.setObjectName("sliderLabel")
+        self._split_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sv.addWidget(self._split_summary)
+
+        self._split_n_lbl = QLabel("N images : —")  # hidden, used by callback
+        self._split_n_lbl.setVisible(False)
+
+        ann_lay.addWidget(self._yolo_split_box)
+
+        # Export button
+        self.exp_run_btn = QPushButton("▶  Export annotations")
+        self.exp_run_btn.setObjectName("runButton")
+        self.exp_run_btn.setFixedHeight(44)
+        self.exp_run_btn.clicked.connect(self._start_export)
+        ann_lay.addWidget(self.exp_run_btn)
+        lay.addWidget(ann_box)
+
+        # ── RangeSlider logic ─────────────────────────────────────────────
+        def _update_split_labels(*_):
+            lo, hi = self._range_slider.lo, self._range_slider.hi
+            train_pct, val_pct, test_pct = lo, hi - lo, 100 - hi
+            n_txt = self._split_n_lbl.text().split(":")[-1].strip()
+            try:
+                n = int(n_txt.split()[0])
+            except Exception:
+                n = 0
+            n_train = round(n * train_pct / 100) if n else 0
+            n_val   = round(n * val_pct   / 100) if n else 0
+            n_test  = n - n_train - n_val         if n else 0
+            def _fmt(pct, nb):
+                return f"{pct}%" + (f"  ({nb} imgs)" if n else "")
+            self._split_summary.setText(
+                f"Train {_fmt(train_pct, n_train)}     "
+                f"Val {_fmt(val_pct, n_val)}     "
+                f"Test {_fmt(test_pct, n_test)}"
+            )
+
+        self._range_slider.changed.connect(_update_split_labels)
+        _update_split_labels()
+        self._update_split_labels = _update_split_labels
+
+        def _on_fmt_toggle():
+            yolo = self._exp_fmt_yolo.isChecked()
+            self._exp_yolo_out.setEnabled(yolo)
+            self._exp_yolo_out.setVisible(yolo)
+            self._yolo_split_box.setVisible(yolo)
+
+        self._exp_fmt_roboflow.toggled.connect(_on_fmt_toggle)
+        self._exp_fmt_yolo.toggled.connect(_on_fmt_toggle)
+
+        # ═════════════════════════════════════════════════════════════════════
+        #  SECTION 2 — METRICS REPORT
+        # ═════════════════════════════════════════════════════════════════════
+        met_box = QGroupBox("2 — Metrics report")
+        met_box.setStyleSheet(
+            "QGroupBox { border-left: 3px solid #1D9E75; border-radius: 0; "
+            "margin-top: 12px; padding: 10px 8px 8px 12px; }"
+            "QGroupBox::title { color: #1D9E75; }"
+        )
+        met_lay = QVBoxLayout(met_box)
+
+        desc = QLabel(
+            "Computes per-image × per-class statistics and writes two CSV files:\n"
+            "  *_summary.csv  (one row per image × class)\n"
+            "  *_aggregate.csv  (one row per class across all images)"
+        )
+        desc.setObjectName("pathLabel")
+        met_lay.addWidget(desc)
+
+        try:
+            from lyra.metric_selector_widget import MetricSelectorWidget
+            self._metric_selector = MetricSelectorWidget(preset="standard")
+            met_lay.addWidget(self._metric_selector)
+        except ImportError:
+            self._metric_selector = None
+            met_lay.addWidget(QLabel(
+                "(metric_selector_widget.py not found — "
+                "all available groups will be computed)"
+            ))
+
+        self.exp_metrics_btn = QPushButton("📊  Generate metrics report")
+        self.exp_metrics_btn.setObjectName("runButton")
+        self.exp_metrics_btn.setFixedHeight(44)
+        self.exp_metrics_btn.setToolTip(
+            "Computes selected metric groups from the chosen CSV\n"
+            "and saves *_summary.csv + *_aggregate.csv alongside it."
+        )
+        self.exp_metrics_btn.clicked.connect(self._start_metrics_report)
+        met_lay.addWidget(self.exp_metrics_btn)
+        lay.addWidget(met_box)
+
+        # ═════════════════════════════════════════════════════════════════════
+        #  SHARED PROGRESS
+        # ═════════════════════════════════════════════════════════════════════
         self.exp_progress = QProgressBar()
         self.exp_progress.setRange(0, 100)
         lay.addWidget(self.exp_progress)
@@ -876,13 +1539,12 @@ class NemaCounterGUI(QMainWindow):
         self.exp_status_lbl.setObjectName("statusLabel")
         lay.addWidget(self.exp_status_lbl)
 
-        self.exp_run_btn = QPushButton("Convert to Roboflow JSON")
-        self.exp_run_btn.setObjectName("runButton")
-        self.exp_run_btn.setFixedHeight(46)
-        self.exp_run_btn.clicked.connect(self._start_export)
-        lay.addWidget(self.exp_run_btn)
         lay.addStretch()
-        return tab
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        return scroll
 
     # =========================================================================
     #  HELPERS UI
@@ -1074,172 +1736,561 @@ class NemaCounterGUI(QMainWindow):
         self._scan_btn.setEnabled(True)
         self._scan_btn.setText("↻  Scan / Refresh")
 
-        # Stats
-        self._stat_images._val_lbl.setText(str(len(result["images"])))
-        self._stat_det_csv._val_lbl.setText(str(len(result["glob_csvs"])))
-        self._stat_seg_csv._val_lbl.setText(str(len(result["seg_csvs"])))
+        # ── Pipeline funnel ─────────────────────────────────────────────────
+        img_info_all = result.get("img_info", {})
+        n_imgs = len(result["images"])
+        n_det  = sum(1 for v in img_info_all.values() if v.get("yolo"))
+        n_sam  = sum(1 for v in img_info_all.values() if v.get("sam"))
+        n_edit = sum(1 for v in img_info_all.values() if v.get("edition"))
+        n_exp  = sum(1 for v in img_info_all.values()
+                     if v.get("exported", {}).get("json") or v.get("exported", {}).get("yolo"))
+        for _si, (_cnt, _tot) in enumerate([
+            (n_imgs, n_imgs), (n_det, n_imgs), (n_sam, n_imgs),
+            (n_edit, n_imgs), (n_exp, n_imgs),
+        ]):
+            if hasattr(self, "_pipe_steps") and _si < len(self._pipe_steps):
+                _vl, _pl = self._pipe_steps[_si]
+                _vl.setText(str(_cnt))
+                _pl.setText(f"{round(100*_cnt/_tot) if _tot else 0} %")
 
-        # ── Lecture des CSVs pour avoir les comptes par image ────────────
-        # Structure retournée : {img_basename: {"count": int, "type": "mask"|"box"|"sam"}}
-        info_yolo: dict[str, dict] = {}   # depuis _globinfo.csv
-        info_sam:  dict[str, dict] = {}   # depuis _segmentation_globinfo.csv
+        img_info = result.get("img_info", {})
 
-        def _load_image_info(csv_paths: list[str],
-                             default_type: str = "box") -> dict[str, dict]:
-            result_info: dict[str, dict] = {}
-            for p in csv_paths:
-                try:
-                    df = pd.read_csv(p, comment="#",
-                                     usecols=["img_id", "object_type"])
-                    real = df[df["object_type"].notna() & (df["object_type"] != "")]
-                    for img_id, grp in real.groupby("img_id"):
-                        key = os.path.basename(str(img_id))
-                        # Détecter si les objets sont des masques ou des boîtes
-                        types = grp["object_type"].unique()
-                        obj_type = "mask" if "mask" in types else default_type
-                        result_info[key] = {
-                            "count": result_info.get(key, {}).get("count", 0) + len(grp),
-                            "type":  obj_type,
-                        }
-                except Exception:
-                    pass
-            return result_info
+        # ── Mise à jour split labels si disponibles ───────────────────────
+        n_img = len(result["images"])
+        if hasattr(self, "_split_n_lbl"):
+            self._split_n_lbl.setText(f"N images : {n_img}")
+        if hasattr(self, "_update_split_labels"):
+            self._update_split_labels()
 
-        info_yolo = _load_image_info(result["glob_csvs"], default_type="box")
-        info_sam  = _load_image_info(result["seg_csvs"],  default_type="sam")
-
-        # Tableau images avec résultats par ligne
+        # ── Table images ──────────────────────────────────────────────────
+        self._img_all_rows = []
         self._img_table.setRowCount(0)
+
         for p in result["images"]:
-            r     = self._img_table.rowCount()
             fname = os.path.basename(p)
             ext   = os.path.splitext(fname)[1].lower()
-            self._img_table.insertRow(r)
+            info  = img_info.get(fname, {})
+            yolo  = info.get("yolo")
+            sam   = info.get("sam")
+            edit  = info.get("edition")
+            exp   = info.get("exported", {})
 
-            yolo = info_yolo.get(fname)
-            sam  = info_sam.get(fname)
-
-            # Col 0 — nom de fichier
-            self._img_table.setItem(r, 0, QTableWidgetItem(fname))
-
-            # Col 1 — résultat YOLO  (boîtes ou masques selon object_type)
-            if yolo:
-                n      = yolo["count"]
-                is_mask = yolo["type"] == "mask"
-                label  = f"{n}  {'🎭' if is_mask else '🔲'}"
-                color  = "#a6e3a1" if is_mask else "#89b4fa"
-            else:
-                label, color = "—", "#6c7086"
-            item_y = QTableWidgetItem(label)
-            item_y.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_y.setForeground(QColor(color))
-            self._img_table.setItem(r, 1, item_y)
-
-            # Col 2 — résultat SAM
-            if sam:
-                label_s = f"{sam['count']}  ✅"
-                color_s = "#cba6f7"
-            else:
-                label_s, color_s = "—", "#6c7086"
-            item_s = QTableWidgetItem(label_s)
-            item_s.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_s.setForeground(QColor(color_s))
-            self._img_table.setItem(r, 2, item_s)
-
-            # Col 3 — statut global
-            if sam:
-                status, color_st = "✅ SAM done",    "#cba6f7"
-            elif yolo and yolo["type"] == "mask":
-                status, color_st = "🎭 YOLO masks",  "#a6e3a1"
+            # ── Déterminer le statut ──────────────────────────────────────
+            if edit:
+                status, st_color = "📝 Édité",       "#f5c2e7"
+            elif sam:
+                status, st_color = "✏  SAM",         "#cba6f7"
+            elif yolo and yolo.get("type") == "mask":
+                status, st_color = "🎭 YOLO masks",  "#a6e3a1"
             elif yolo:
-                status, color_st = "🔲 YOLO boxes",  "#89b4fa"
+                status, st_color = "🔲 YOLO boxes",  "#89b4fa"
             else:
-                status, color_st = "⬜ pending",      "#6c7086"
-            item_st = QTableWidgetItem(status)
-            item_st.setForeground(QColor(color_st))
-            item_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._img_table.setItem(r, 3, item_st)
+                status, st_color = "⬜ En attente",   "#6c7086"
 
-            # Col 4 — extension
-            self._img_table.setItem(r, 4, QTableWidgetItem(ext))
+            # ── Colonne YOLO ──────────────────────────────────────────────
+            if yolo:
+                icon_y  = "🎭" if yolo.get("type") == "mask" else "🔲"
+                lbl_y   = f"{yolo['count']} {icon_y}"
+                col_y   = "#a6e3a1" if yolo.get("type") == "mask" else "#89b4fa"
+            else:
+                lbl_y, col_y = "—", "#6c7086"
 
-        # Tableau CSVs avec stats
-        self._csv_table.setRowCount(0)
-        for p in result["glob_csvs"] + result["seg_csvs"]:
-            r     = self._csv_table.rowCount()
-            self._csv_table.insertRow(r)
-            fname = os.path.basename(p)
-            typ   = "Segmentation" if p.endswith(CSV_SEG_SUFFIX) else "Detection"
-            rel   = os.path.relpath(os.path.dirname(p), self._work_dir)
+            # ── Colonne SAM ───────────────────────────────────────────────
+            if sam:
+                lbl_s, col_s = f"{sam['count']} ✏", "#cba6f7"
+            else:
+                lbl_s, col_s = "—", "#6c7086"
 
-            # ── Lecture stats depuis le CSV ───────────────────────────────
-            n_images  = "?"
-            n_objects = "?"
+            # ── Colonne Edition ───────────────────────────────────────────
+            if edit:
+                lbl_e, col_e = f"{edit['count']} 📝", "#f5c2e7"
+            else:
+                lbl_e, col_e = "—", "#6c7086"
+
+            # ── Colonne Δ (différence annotations) ───────────────────────
+            diff = edit.get("diff") if edit else None
+            if diff is not None:
+                sign   = "+" if diff > 0 else ""
+                lbl_d  = f"{sign}{diff}"
+                col_d  = "#a6e3a1" if diff > 0 else ("#f38ba8" if diff < 0 else "#6c7086")
+            else:
+                lbl_d, col_d = "—", "#6c7086"
+
+            # ── Colonne Export ────────────────────────────────────────────
+            exp_parts = []
+            if exp.get("json"): exp_parts.append("JSON")
+            if exp.get("yolo"): exp_parts.append("YOLO")
+            lbl_exp = " · ".join(exp_parts) if exp_parts else "—"
+            col_exp = "#f9e2af" if exp_parts else "#6c7086"
+
+            # Stocker pour le filtre
+            self._img_all_rows.append({
+                "fname":       fname,
+                "ext":         ext,
+                "full_path":   p,                                           # chemin absolu image
+                "yolo_csv":    yolo["csv_path"] if yolo else None,         # CSV YOLO source
+                "sam_csv":     sam["csv_path"]  if sam  else None,         # CSV SAM source
+                "edition_csv": edit["csv_path"] if edit else None,         # CSV édition source
+                "lbl_y": lbl_y, "col_y": col_y,
+                "lbl_s": lbl_s, "col_s": col_s,
+                "lbl_e": lbl_e, "col_e": col_e,
+                "lbl_d": lbl_d, "col_d": col_d,
+                "lbl_exp": lbl_exp, "col_exp": col_exp,
+                "status": status, "st_color": st_color,
+                "has_yolo": bool(yolo), "has_sam": bool(sam),
+                "has_edit": bool(edit), "has_exp": bool(exp_parts),
+                "pending": not (yolo or sam or edit),
+            })
+
+        self._apply_img_filter()  # remplit la table selon filtre actif
+
+        # ── Table résultats ───────────────────────────────────────────────
+        # Précharger les classes par CSV
+        def _csv_classes(p):
             try:
-                df = pd.read_csv(p, comment="#", usecols=["img_id", "object_type"])
+                df = pd.read_csv(p, comment="#", usecols=["name"])
+                names = sorted(df["name"].dropna().unique().tolist())
+                return ", ".join(names[:5]) + (f" +{len(names)-5}" if len(names) > 5 else "")
+            except Exception:
+                return "—"
+
+        # Construire un index des exports disponibles (stem → chemin)
+        json_stems = {
+            os.path.basename(p).replace("_roboflow_coco.json", ""): p
+            for p in result.get("json_exports", [])
+        }
+        yolo_dirs = {
+            os.path.dirname(p): p
+            for p in result.get("yolo_exports", [])
+        }
+
+        all_csvs = (
+            [(p, "Détection YOLO")  for p in result["glob_csvs"]]
+          + [(p, "Segmentation SAM") for p in result["seg_csvs"]]
+          + [(p, "Édition manuelle") for p in result.get("edit_csvs", [])]
+        )
+
+        type_colors = {
+            "Détection YOLO":    "#89b4fa",
+            "Segmentation SAM":  "#cba6f7",
+            "Édition manuelle":  "#f5c2e7",
+        }
+
+        self._csv_table.setRowCount(0)
+        for p, typ in all_csvs:
+            r = self._csv_table.rowCount()
+            self._csv_table.insertRow(r)
+            fname  = os.path.basename(p)
+            rel    = os.path.relpath(os.path.dirname(p), self._work_dir)
+            n_img_str  = "?"
+            n_obj_str  = "?"
+            try:
+                df   = pd.read_csv(p, comment="#", usecols=["img_id", "object_type"])
                 real = df[df["object_type"].notna() & (df["object_type"] != "")]
-                n_images  = str(df["img_id"].nunique())
-                n_objects = str(len(real))
+                n_img_str = str(df["img_id"].nunique())
+                n_obj_str = str(len(real))
             except Exception:
                 pass
+
+            classes_str = _csv_classes(p)
+
+            # JSON export correspondant ?
+            stem        = fname.replace("_globinfo.csv","").replace("_segmentation_globinfo.csv","").replace("_edition_globinfo.csv","")
+            has_json    = stem in json_stems
+            # YOLO export dans le même dossier projet ?
+            proj_dir    = os.path.dirname(p)
+            has_yolo_ds = any(proj_dir in d or d.startswith(proj_dir) for d in yolo_dirs)
 
             item0 = QTableWidgetItem(fname)
             item0.setData(Qt.ItemDataRole.UserRole, p)
             self._csv_table.setItem(r, 0, item0)
-            self._csv_table.setItem(r, 1, QTableWidgetItem(typ))
 
-            item_img = QTableWidgetItem(n_images)
-            item_img.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._csv_table.setItem(r, 2, item_img)
+            typ_item = QTableWidgetItem(typ)
+            typ_item.setForeground(QColor(type_colors.get(typ, "#cdd6f4")))
+            self._csv_table.setItem(r, 1, typ_item)
 
-            item_obj = QTableWidgetItem(n_objects)
-            item_obj.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Coloriser si des objets ont été trouvés
-            if n_objects.isdigit() and int(n_objects) > 0:
-                item_obj.setForeground(QColor("#a6e3a1"))
-            self._csv_table.setItem(r, 3, item_obj)
+            for col, val, align in [
+                (2, n_img_str,   True),
+                (3, n_obj_str,   True),
+                (4, classes_str, False),
+            ]:
+                it = QTableWidgetItem(val)
+                if align:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if col == 3 and n_obj_str.isdigit() and int(n_obj_str) > 0:
+                    it.setForeground(QColor("#a6e3a1"))
+                self._csv_table.setItem(r, col, it)
 
-            self._csv_table.setItem(r, 4, QTableWidgetItem(rel))
+            # Export JSON
+            json_it = QTableWidgetItem("✅ oui" if has_json else "—")
+            json_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            json_it.setForeground(QColor("#f9e2af" if has_json else "#6c7086"))
+            self._csv_table.setItem(r, 5, json_it)
 
-        # Combo Edition + Export
+            # Export YOLO
+            yolo_it = QTableWidgetItem("✅ oui" if has_yolo_ds else "—")
+            yolo_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            yolo_it.setForeground(QColor("#fab387" if has_yolo_ds else "#6c7086"))
+            self._csv_table.setItem(r, 6, yolo_it)
+
+            # Colonne 7 : date de modification
+            try:
+                import time
+                mtime = os.path.getmtime(p)
+                date_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            except Exception:
+                date_str = "—"
+            date_it = QTableWidgetItem(date_str)
+            date_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            date_it.setForeground(QColor("#888"))
+            self._csv_table.setItem(r, 7, date_it)
+
+            # Colonne 8 : chemin relatif
+            path_it = QTableWidgetItem(rel)
+            path_it.setForeground(QColor("#888"))
+            self._csv_table.setItem(r, 8, path_it)
+
+        # ── Remplir les combos Edition + Export ───────────────────────────
         self._edit_csv_combo.clear()
         self._exp_csv_combo.clear()
-        all_csvs = result["glob_csvs"] + result["seg_csvs"]
-        if all_csvs:
-            for p in all_csvs:
+        all_csv_paths = result["glob_csvs"] + result["seg_csvs"] + result.get("edit_csvs", [])
+        if all_csv_paths:
+            for p in all_csv_paths:
                 label = os.path.basename(p)
                 self._edit_csv_combo.addItem(label, p)
                 self._exp_csv_combo.addItem(label, p)
-            # Auto-sélectionner le dernier globinfo dans Edition
-            last_glob = result["glob_csvs"][-1] if result["glob_csvs"] else all_csvs[-1]
-            idx = self._edit_csv_combo.findData(last_glob)
+            last = result["glob_csvs"][-1] if result["glob_csvs"] else all_csv_paths[-1]
+            idx = self._edit_csv_combo.findData(last)
             if idx >= 0:
                 self._edit_csv_combo.setCurrentIndex(idx)
         else:
-            self._edit_csv_combo.addItem("(no CSVs found)")
-            self._exp_csv_combo.addItem("(no CSVs found)")
+            self._edit_csv_combo.addItem("(aucun CSV trouvé)")
+            self._exp_csv_combo.addItem("(aucun CSV trouvé)")
 
         self._sync_ctx()
 
+    def _apply_img_filter(self, *_):
+        """Remplit la table images selon le filtre actif."""
+        self._img_table.setRowCount(0)
+        flt = self._img_filter.currentText() if hasattr(self, "_img_filter") else "Toutes"
+
+        for row_data in self._img_all_rows:
+            if flt == "En attente" and not row_data["pending"]:      continue
+            if flt == "Détection"  and not row_data["has_yolo"]:     continue
+            if flt == "SAM"        and not row_data["has_sam"]:      continue
+            if flt == "Édition"    and not row_data["has_edit"]:     continue
+            if flt == "Exportées"  and not row_data["has_exp"]:      continue
+
+            r = self._img_table.rowCount()
+            self._img_table.insertRow(r)
+
+            # Stocker l'index réel dans _img_all_rows en UserRole
+            # (crucial quand un filtre est actif : table row ≠ all_rows index)
+            name_item = QTableWidgetItem(row_data["fname"])
+            name_item.setData(Qt.ItemDataRole.UserRole, self._img_all_rows.index(row_data))
+            self._img_table.setItem(r, 0, name_item)
+
+            for col, lbl, col_hex in [
+                (1, row_data["lbl_y"],   row_data["col_y"]),
+                (2, row_data["lbl_s"],   row_data["col_s"]),
+                (3, row_data["lbl_e"],   row_data["col_e"]),
+                (4, row_data["lbl_d"],   row_data["col_d"]),
+                (5, row_data["lbl_exp"], row_data["col_exp"]),
+            ]:
+                it = QTableWidgetItem(lbl)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                it.setForeground(QColor(col_hex))
+                self._img_table.setItem(r, col, it)
+
+            st_it = QTableWidgetItem(row_data["status"])
+            st_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            st_it.setForeground(QColor(row_data["st_color"]))
+            self._img_table.setItem(r, 6, st_it)
+
+            self._img_table.setItem(r, 7, QTableWidgetItem(row_data["ext"]))
+
+    def _on_img_selection_changed(self):
+        """Met à jour le panneau détail + thumbnail + boutons toggle."""
+        rows   = self._img_table.selectionModel().selectedRows()
+        has_sel = len(rows) > 0
+
+        # Boutons d'action
+        self._ov_open_edit_btn.setEnabled(has_sel)
+        self._ov_run_pending_btn.setEnabled(has_sel)
+        self._ov_quick_edit_btn.setEnabled(has_sel)
+        self._ov_quick_export_btn.setEnabled(has_sel)
+
+        if not has_sel:
+            self._thumb_lbl.setText("Sélectionnez\nune image")
+            self._thumb_lbl.setPixmap(QPixmap())
+            for key in ("Fichier","Dimensions","YOLO","SAM","Édition","Δ ann.","Export","CSV source","Modifié"):
+                self._detail_card.update_value(key, "—")
+            for b in self._thumb_mode_btns.values():
+                b.setEnabled(False); b.setChecked(False)
+            self._thumb_current_rd = None
+            return
+
+        r = rows[0].row()
+        item0 = self._img_table.item(r, 0)
+        idx = item0.data(Qt.ItemDataRole.UserRole) if item0 else None
+        if idx is None or idx >= len(self._img_all_rows):
+            return
+        rd = self._img_all_rows[idx]
+        self._thumb_current_rd = rd
+
+        # ── Activer les boutons toggle selon disponibilité ─────────────────
+        avail = {
+            "raw":     bool(rd.get("full_path")),
+            "yolo":    bool(rd.get("yolo_csv")),
+            "sam":     bool(rd.get("sam_csv")),
+            "edition": bool(rd.get("edition_csv")),
+        }
+        # Sélection automatique du mode le plus avancé disponible
+        best = next(
+            (m for m in ("edition", "sam", "yolo", "raw") if avail.get(m)), "raw"
+        )
+        for mode, btn in self._thumb_mode_btns.items():
+            btn.setEnabled(avail[mode])
+            btn.setChecked(mode == best)
+        self._thumb_current_mode = best
+
+        # ── Rendu thumbnail ────────────────────────────────────────────────
+        self._render_thumb(rd, best)
+
+        # ── InfoCard ───────────────────────────────────────────────────────
+        self._detail_card.update_value("Fichier",  rd["fname"])
+        self._detail_card.update_value("YOLO",     rd["lbl_y"])
+        self._detail_card.update_value("SAM",      rd["lbl_s"])
+        self._detail_card.update_value("Édition",  rd["lbl_e"])
+        self._detail_card.update_value("Δ ann.",   rd["lbl_d"])
+        self._detail_card.update_value("Export",   rd["lbl_exp"])
+
+        # CSV source le plus avancé + date
+        csv_src = rd.get("edition_csv") or rd.get("sam_csv") or rd.get("yolo_csv")
+        if csv_src:
+            self._detail_card.update_value("CSV source", os.path.basename(csv_src))
+            try:
+                import time
+                mt = os.path.getmtime(csv_src)
+                self._detail_card.update_value("Modifié", time.strftime("%Y-%m-%d %H:%M", time.localtime(mt)))
+            except Exception:
+                self._detail_card.update_value("Modifié", "—")
+        else:
+            self._detail_card.update_value("CSV source", "—")
+            self._detail_card.update_value("Modifié",   "—")
+
+    def _set_thumb_mode(self, mode: str):
+        """Appelé par un bouton toggle du panneau détail."""
+        if self._thumb_current_rd is None:
+            return
+        self._thumb_current_mode = mode
+        # Décocher tous les autres
+        for m, btn in self._thumb_mode_btns.items():
+            btn.setChecked(m == mode)
+        self._render_thumb(self._thumb_current_rd, mode)
+
+    def _render_thumb(self, rd: dict, mode: str):
+        """
+        Affiche la miniature dans le mode demandé :
+          raw     → image brute
+          yolo    → overlay annotations YOLO
+          sam     → overlay masques SAM
+          edition → overlay annotations d'édition
+        Ajoute un bandeau coloré en bas pour indiquer le mode.
+        """
+        full_path = rd.get("full_path", "")
+        if not full_path or not os.path.exists(full_path):
+            self._thumb_lbl.setText("Image\nintrouvable")
+            return
+        try:
+            bgr = cv2.imread(full_path)
+            if bgr is None:
+                self._thumb_lbl.setText("Illisible")
+                return
+            h, w = bgr.shape[:2]
+
+            # Choisir le CSV source selon le mode
+            csv_map = {
+                "raw":     None,
+                "yolo":    rd.get("yolo_csv"),
+                "sam":     rd.get("sam_csv"),
+                "edition": rd.get("edition_csv"),
+            }
+            csv_path = csv_map.get(mode)
+
+            # Dessiner les annotations
+            if csv_path:
+                rd_tmp = dict(rd)  # copie pour ne pas muter
+                rd_tmp["_override_csv"] = csv_path
+                bgr = self._draw_overview_annotations(bgr, rd_tmp)
+
+            # Bandeau coloré en bas indiquant le mode
+            banner_colors = {
+                "raw":     (80,  80,  80),
+                "yolo":    (137, 180, 250),   # #89b4fa
+                "sam":     (203, 166, 247),   # #cba6f7
+                "edition": (245, 194, 231),   # #f5c2e7
+            }
+            color = banner_colors.get(mode, (80, 80, 80))
+            bh = max(4, h // 40)
+            bgr[-bh:, :] = color
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            thumb_w, thumb_h = 320, 210
+            scale = min(thumb_w / w, thumb_h / h)
+            nw, nh = int(w * scale), int(h * scale)
+            rgb_small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+            from PyQt6.QtGui import QImage
+            img_qt = QImage(rgb_small.data, nw, nh, nw * 3, QImage.Format.Format_RGB888)
+            self._thumb_lbl.setPixmap(
+                QPixmap.fromImage(img_qt).scaled(
+                    thumb_w, thumb_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            self._detail_card.update_value("Dimensions", f"{w} × {h} px")
+        except Exception as exc:
+            self._thumb_lbl.setText("Erreur\nde prévisualisation")
+            log.warning(f"Thumb render error: {exc}")
+
+    def _draw_overview_annotations(self, bgr: np.ndarray, rd: dict) -> np.ndarray:
+        """
+        Dessine un aperçu rapide des annotations sur le thumbnail.
+        Si rd contient "_override_csv", utilise ce CSV directement.
+        Sinon priorité : édition > SAM > YOLO.
+        Retourne une copie annotée de l'image.
+        """
+        img = bgr.copy()
+        # Chemin CSV : override explicite (mode toggle) ou meilleur disponible
+        if rd.get("_override_csv"):
+            csv_path = rd["_override_csv"]
+        else:
+            csv_path = None
+            for key in ("edition_csv", "sam_csv", "yolo_csv"):
+                if rd.get(key):
+                    csv_path = rd[key]
+                    break
+        if not csv_path or not os.path.exists(csv_path):
+            return img
+
+        try:
+            df = pd.read_csv(csv_path, comment="#",
+                             usecols=["img_id", "xmin", "ymin", "xmax", "ymax",
+                                      "object_type", "contours"])
+            fname = rd["fname"]
+            sub = df[df["img_id"].apply(os.path.basename) == fname]
+            h, w = img.shape[:2]
+            overlay = img.copy()
+            for _, row in sub.iterrows():
+                ot = str(row.get("object_type", "box")).lower()
+                if ot == "box":
+                    x0, y0 = int(row["xmin"]), int(row["ymin"])
+                    x1, y1 = int(row["xmax"]), int(row["ymax"])
+                    cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 200, 0), 1)
+                elif ot in ("mask", "polygon"):
+                    try:
+                        clist = json.loads(row.get("contours", "[]"))
+                        for pts in clist:
+                            cnt = np.array(pts, dtype=np.int32)
+                            cv2.polylines(overlay, [cnt], True, (150, 255, 150), 1)
+                    except Exception:
+                        pass
+            cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+        except Exception:
+            pass
+        return img
+
+    def _on_img_double_clicked(self, row: int, _col: int):
+        """Double-clic sur une image → bascule sur Édition avec le meilleur CSV."""
+        item0 = self._img_table.item(row, 0)
+        all_rows_idx = item0.data(Qt.ItemDataRole.UserRole) if item0 else None
+        if all_rows_idx is not None and all_rows_idx < len(self._img_all_rows):
+            self._open_image_in_edition(all_rows_idx)
+
+    def _ov_open_in_edition(self):
+        """Ouvre l'image sélectionnée dans l'onglet Édition avec le meilleur CSV."""
+        rows = self._img_table.selectionModel().selectedRows()
+        if rows:
+            self._open_image_in_edition(rows[0].row())
+
+    def _open_image_in_edition(self, row: int):
+        """
+        Sélectionne le meilleur CSV disponible pour la ligne donnée et bascule
+        sur l'onglet Édition.
+        Priorité : édition > SAM > YOLO (annotation la plus avancée).
+        """
+        if row >= len(self._img_all_rows):
+            return
+        rd = self._img_all_rows[row]
+
+        # Trouver le meilleur CSV
+        csv_path = rd.get("edition_csv") or rd.get("sam_csv") or rd.get("yolo_csv")
+
+        if csv_path and os.path.exists(csv_path):
+            # Injecter dans le combo Edition
+            idx = self._edit_csv_combo.findData(csv_path)
+            if idx >= 0:
+                self._edit_csv_combo.setCurrentIndex(idx)
+            else:
+                self._edit_csv_combo.addItem(os.path.basename(csv_path), csv_path)
+                self._edit_csv_combo.setCurrentIndex(self._edit_csv_combo.count() - 1)
+            # Rafraîchir l'info-card Edition
+            self._refresh_edit_info(csv_path)
+            # Auto-fill project name
+            stem = os.path.splitext(os.path.basename(csv_path))[0]
+            proj = (stem.replace("_globinfo", "")
+                        .replace("_segmentation", "")
+                        .replace("_edition", "") + "_Edition")
+            self._edit_proj_edit.setText(proj)
+        else:
+            # Pas de CSV — mode image vierge : juste basculer sur Edition
+            # (l'utilisateur devra choisir manuellement)
+            pass
+
+        self.tabs.setCurrentIndex(2)
+
+    def _ov_quick_export(self):
+        """Export rapide depuis le panneau détail : injecte le meilleur CSV dans Export + bascule."""
+        if self._thumb_current_rd is None:
+            return
+        rd = self._thumb_current_rd
+        csv_path = rd.get("edition_csv") or rd.get("sam_csv") or rd.get("yolo_csv")
+        if not csv_path or not os.path.exists(csv_path):
+            QMessageBox.information(self, "Export",
+                "Aucune annotation disponible pour cette image.\n"
+                "Lancez d'abord une détection ou une session d'édition.")
+            return
+        # Injecter dans le combo Export
+        idx = self._exp_csv_combo.findData(csv_path)
+        if idx >= 0:
+            self._exp_csv_combo.setCurrentIndex(idx)
+        else:
+            self._exp_csv_combo.addItem(os.path.basename(csv_path), csv_path)
+            self._exp_csv_combo.setCurrentIndex(self._exp_csv_combo.count() - 1)
+        self.tabs.setCurrentIndex(3)   # bascule sur Export
+
     def _on_csv_double_clicked(self, row: int, _col: int):
-        """Double-clic sur un CSV dans la table → l'injecte dans Edition et Export."""
+        """Double-clic sur un CSV → l'injecte dans Edition et Export, bascule sur Edition."""
         item = self._csv_table.item(row, 0)
-        if item:
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if path and os.path.exists(path):
-                # Sélectionner dans le combo Edition si présent
-                idx = self._edit_csv_combo.findData(path)
-                if idx >= 0:
-                    self._edit_csv_combo.setCurrentIndex(idx)
-                else:
-                    # Ajouter et sélectionner
-                    self._edit_csv_combo.addItem(os.path.basename(path), path)
-                    self._edit_csv_combo.setCurrentIndex(self._edit_csv_combo.count() - 1)
-                # Export combo
-                if self._exp_csv_combo.findData(path) == -1:
-                    self._exp_csv_combo.addItem(os.path.basename(path), path)
-                # Aller sur l'onglet edition
-                self.tabs.setCurrentIndex(2)
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path or not os.path.exists(path):
+            return
+        # Edition combo
+        idx = self._edit_csv_combo.findData(path)
+        if idx >= 0:
+            self._edit_csv_combo.setCurrentIndex(idx)
+        else:
+            self._edit_csv_combo.addItem(os.path.basename(path), path)
+            self._edit_csv_combo.setCurrentIndex(self._edit_csv_combo.count() - 1)
+        # Export combo
+        if self._exp_csv_combo.findData(path) == -1:
+            self._exp_csv_combo.addItem(os.path.basename(path), path)
+        self._refresh_edit_info(path)
+        self.tabs.setCurrentIndex(2)
+
 
     # =========================================================================
     #  RUN
@@ -1388,7 +2439,7 @@ class NemaCounterGUI(QMainWindow):
         img_dir  = self._work_dir
         csv_path = self._edit_csv_row.path
 
-        viewer = napari.Viewer(title="NemaCounter — Manual Edition")
+        viewer = napari.Viewer(title="LYRA — Manual Edition")
 
         if os.path.isdir(img_dir):
             imgs = sorted(
@@ -1434,7 +2485,7 @@ class NemaCounterGUI(QMainWindow):
         QApplication.processEvents()  # forcer l'affichage du message
 
         try:
-            from nemacounter.edition import EditionWindow
+            from lyra.edition_engine import EditionWindow
             win = EditionWindow()
             win.output_directory = os.path.join(outdir, proj_id)
             win.project_id       = proj_id
@@ -1448,7 +2499,7 @@ class NemaCounterGUI(QMainWindow):
             self._edition_window = win
 
             # Connecter la fermeture pour réactiver le bouton
-            win.destroyed.connect(self._on_edition_window_closed)
+            win.closed.connect(self._on_edition_window_closed)
 
             self.edit_status_lbl.setText(
                 f"✅  Edition window open — {proj_id}"
@@ -1465,7 +2516,7 @@ class NemaCounterGUI(QMainWindow):
         self._edition_window = None
         # Rafraîchir le scan pour voir les nouveaux CSVs d'édition
         if self._work_dir:
-            self._run_scan()
+            self._scan_project()
 
     # =========================================================================
     #  EXPORT
@@ -1477,11 +2528,32 @@ class NemaCounterGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Select a valid globinfo CSV.")
             return
 
+        fmt = "yolo" if self._exp_fmt_yolo.isChecked() else "roboflow"
+
+        if fmt == "yolo":
+            out_dir = self._exp_yolo_out.path
+            if not out_dir:
+                QMessageBox.warning(self, "YOLO export",
+                    "Sélectionnez un dossier de sortie pour le dataset YOLO.")
+                return
+            # Lire le RangeSlider : lo = frontière train|val, hi = frontière val|test
+            train_pct = self._range_slider.lo
+            val_pct   = self._range_slider.hi - self._range_slider.lo
+            test_pct  = 100 - self._range_slider.hi
+        else:
+            out_dir   = ""
+            train_pct = 100
+            val_pct   = 0
+            test_pct  = 0
+
         self.exp_progress.setValue(0)
-        self.exp_status_lbl.setText("Starting conversion…")
+        self.exp_status_lbl.setText("Démarrage…")
         self.exp_run_btn.setEnabled(False)
 
-        self._exp_worker = ExportWorker(csv_path)
+        self._exp_worker = ExportWorker(
+            csv_path, format=fmt, output_dir=out_dir,
+            train_pct=train_pct, val_pct=val_pct, test_pct=test_pct,
+        )
         self._exp_worker.progress.connect(lambda v: self.exp_progress.setValue(int(v * 100)))
         self._exp_worker.status.connect(self.exp_status_lbl.setText)
         self._exp_worker.finished.connect(self._on_export_finished)
@@ -1493,6 +2565,59 @@ class NemaCounterGUI(QMainWindow):
             self.exp_progress.setValue(100)
             self.exp_status_lbl.setText("✅  " + msg)
             QMessageBox.information(self, "Success", msg)
+        else:
+            self.exp_progress.setValue(0)
+            self.exp_status_lbl.setText("❌  " + msg)
+            QMessageBox.critical(self, "Error", msg)
+
+    def _start_metrics_report(self):
+        """
+        Launches an enhanced metrics report from the selected globinfo CSV.
+        Uses the metric groups selected in MetricSelectorWidget.
+        Produces *_summary.csv and *_aggregate.csv.
+        """
+        csv_path = self._exp_csv_row.path or self._exp_csv_combo.currentData()
+        if not csv_path or not os.path.exists(csv_path):
+            QMessageBox.warning(self, "Error", "Select a valid globinfo CSV first.")
+            return
+
+        selected_groups = self._metric_selector.selected_groups()
+
+        # Build image_paths dict if density metrics are requested
+        image_paths: dict | None = None
+        if "density" in selected_groups and self._work_dir:
+            try:
+                df_tmp = pd.read_csv(csv_path, comment="#", usecols=["img_id"])
+                image_paths = {}
+                for rel in df_tmp["img_id"].unique():
+                    abs_p = os.path.join(self._work_dir, str(rel))
+                    if os.path.exists(abs_p):
+                        image_paths[str(rel)] = abs_p
+            except Exception:
+                pass
+
+        self.exp_progress.setValue(0)
+        self.exp_status_lbl.setText("Génération du rapport métriques…")
+        self.exp_metrics_btn.setEnabled(False)
+        self.exp_run_btn.setEnabled(False)
+
+        self._metrics_worker = _MetricsWorker(
+            csv_path, selected_groups, image_paths
+        )
+        self._metrics_worker.progress.connect(
+            lambda v: self.exp_progress.setValue(int(v * 100))
+        )
+        self._metrics_worker.status.connect(self.exp_status_lbl.setText)
+        self._metrics_worker.finished.connect(self._on_metrics_finished)
+        self._metrics_worker.start()
+
+    def _on_metrics_finished(self, ok: bool, msg: str):
+        self.exp_metrics_btn.setEnabled(True)
+        self.exp_run_btn.setEnabled(True)
+        if ok:
+            self.exp_progress.setValue(100)
+            self.exp_status_lbl.setText("✅  " + msg)
+            QMessageBox.information(self, "Metrics report", msg)
         else:
             self.exp_progress.setValue(0)
             self.exp_status_lbl.setText("❌  " + msg)
@@ -1716,6 +2841,6 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    w = NemaCounterGUI()
+    w = LYRAApp()
     w.show()
     sys.exit(app.exec())

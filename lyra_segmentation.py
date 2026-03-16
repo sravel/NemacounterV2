@@ -1,7 +1,7 @@
 
 
-from nemacounter.argsparsers import segmentation_argument_parser
-from nemacounter.detection_engine import segmentation_workflow
+from lyra.argsparsers import segmentation_argument_parser
+from lyra.detection_engine import segmentation_workflow
 
 
     

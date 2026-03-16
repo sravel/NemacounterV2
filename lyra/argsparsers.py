@@ -1,7 +1,7 @@
 import argparse
 
 def detection_argument_parser():
-    parser = argparse.ArgumentParser(prog="NemaCounter", description="Detect and segment nematodes from images")
+    parser = argparse.ArgumentParser(prog="LYRA", description="Detect and segment nematodes from images")
     parser.add_argument("-i", "--input_directory", type=str, help="path to the images directory", required=True)
     parser.add_argument("-o", "--output_directory", type=str, help="path to the output directory. Will store several sub-directories. If the directory path already exist, the program will stop", required=True)
     parser.add_argument("-p", "--project_id", type=str, help="a session identifier. Will be added to the output file. Usefull to differenciate several instances.", default='my_session')
@@ -16,7 +16,7 @@ def detection_argument_parser():
 
 
 def edition_argument_parser():
-    parser = argparse.ArgumentParser(prog="NemaCounter", description="Detect and segment nematodes from images")
+    parser = argparse.ArgumentParser(prog="LYRA", description="Detect and segment nematodes from images")
     parser.add_argument("-i", "--input_file", type=str, help="path to the project directory", required=True)
     parser.add_argument("-o", "--output_dir", type=str, help="path to the output directory. Will store several sub-directories. If the directory path already exist, the program will stop", required=True)
     parser.add_argument("-p", "--project_id", type=str, help="a session identifier. Will be added to the output file. Usefull to differenciate several instances.", default='my_session')  
@@ -24,7 +24,7 @@ def edition_argument_parser():
 
 
 def segmentation_argument_parser():
-    parser = argparse.ArgumentParser(prog="NemaCounter", description="Detect and segment nematodes from images")
+    parser = argparse.ArgumentParser(prog="LYRA", description="Detect and segment nematodes from images")
     parser.add_argument("-i", "--input_file", type=str, help="path to the input file", required=True)
     # parser.add_argument("-p", "--project_id", type=str, help="a session identifier. Will be added to the output file. Usefull to differenciate several instances.", default='my_session')  
     # parser.add_argument("--segany_path", type=str, help="path to the trained segment anything model", default='models/sam_vit_h_4b8939.pth')

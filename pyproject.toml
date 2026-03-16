@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  LYRA — Laboratory YOLO Recognition & Analysis
+#  pyproject.toml  (PEP 517 / PEP 621)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Build system ──────────────────────────────────────────────────────────────
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [
+    "setuptools>=68.2.0",
+    "setuptools_scm[toml]>=8.0.0",
+    "build>=1.0.0",
+]
+
+# ── Automatic version from Git tags (e.g. 1.0.0, 1.0.0-beta1) ───────────────
+[tool.setuptools_scm]
+write_to        = "lyra/_version.py"
+version_scheme  = "release-branch-semver"
+tag_regex       = "^(\\d.\\d.\\d)-*\\w*\\d*$"
+local_scheme    = "no-local-version"
+
+# ── Package discovery ─────────────────────────────────────────────────────────
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["lyra*"]
+
+# ── Project metadata ──────────────────────────────────────────────────────────
+[project]
+name        = "lyra"
+dynamic     = ["version"]
+description = "Laboratory YOLO Recognition & Analysis — detect, segment and annotate microscopy images with YOLO and SAM2."
+authors = [
+    { name = "Ravel Sebastien (CIRAD)", email = "sebastien.ravel@cirad.fr" },
+    { name = "Mejias Joffrey (CIRAD)",  email = "joffrey.mejias@cirad.fr"  },
+]
+maintainers = [
+    { name = "Ravel Sebastien (CIRAD)", email = "sebastien.ravel@cirad.fr" },
+]
+requires-python = ">=3.10,<3.14"
+readme          = "README.md"
+license         = { file = "LICENCE" }
+keywords = [
+    "YOLO", "SAM2", "image", "detection", "segmentation",
+    "microscopy", "laboratory", "annotation", "napari",
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "License :: Free for non-commercial use",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Natural Language :: English",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# ── Runtime dependencies ──────────────────────────────────────────────────────
+# Core scientific stack
+dependencies = [
+    # Data
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "opencv-python-headless>=4.8",
+    "Pillow>=10.0",
+    "psutil>=5.9",
+    "pyyaml>=6.0",
+
+    # Deep learning
+    "torch>=2.0",
+    "ultralytics>=8.0",            # YOLO detect + segment
+    "sam2>=1.0",                   # SAM 2.1 / SAM3 — facebook/sam2
+
+    # GUI
+    "PyQt6>=6.5",
+    "napari>=0.4.19",
+    "napari[pyqt6]>=0.4.19",
+
+    # Export
+    "openpyxl>=3.1",               # optional xlsx support
+]
+
+# ── Optional dependency groups ────────────────────────────────────────────────
+[project.optional-dependencies]
+# Development & documentation tools
+dev = [
+    "sphinx>=7.0",
+    "sphinx-click",
+    "sphinx-copybutton",
+    "sphinx-rtd-theme",
+    "tox",
+    "pytest>=7.0",
+    "pytest-qt",
+]
+# Full GPU support (user installs matching torch+cuda version separately)
+gpu = [
+    "torch>=2.0",                  # pin your cuda variant manually if needed
+]
+
+# ── Entry points ──────────────────────────────────────────────────────────────
+[project.scripts]
+# Main GUI
+lyra      = "lyra.main_gui:main"
+
+# CLI entry points (headless, script-based)
+lyra-detect  = "lyra.lyra_detection:main"
+lyra-segment = "lyra.lyra_segmentation:main"
+
+# ── Project URLs ──────────────────────────────────────────────────────────────
+[project.urls]
+Homepage       = "https://forge.ird.fr/phim/sravel/lyra"
+Downloads      = "https://forge.ird.fr/phim/sravel/lyra/archive/"
+"Bug Tracker"  = "https://forge.ird.fr/phim/sravel/lyra/issues"
+Documentation  = "https://lyra.readthedocs.io/en/latest/"
+"Source Code"  = "https://forge.ird.fr/phim/sravel/lyra"

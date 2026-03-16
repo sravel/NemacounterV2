@@ -2,8 +2,8 @@
 Detection Engine
 ================
 Module unifié gérant :
-  - NemaCounterDetection  : inférence YOLO (detect & segment), averaging, métriques
-  - NemaCounterSegmentation : segmentation SAM2 sur annotations existantes
+  - LYRADetection  : inférence YOLO (detect & segment), averaging, métriques
+  - LYRASegmentation : segmentation SAM2 sur annotations existantes
   - detection_workflow()    : pipeline YOLO complet → CSV
   - segmentation_workflow() : pipeline SAM2 sur CSV de détection → CSV
 
@@ -32,8 +32,8 @@ import pandas as pd
 import torch
 
 try:
-    import nemacounter.utils as utils
-    import nemacounter.common as common
+    import lyra.utils as utils
+    import lyra.common as common
 except ImportError:
     utils = None
     common = None
@@ -126,7 +126,7 @@ def _enforce_df_schema(df: pd.DataFrame, project_id: str) -> pd.DataFrame:
         for col in ("img_id", "name", "object_type", "project_id", "contours"):
             df[col] = df[col].astype(str).replace("<NA>", "")
     except Exception as e:
-        logging.getLogger("NemaCounter").warning(f"Schema type enforcement partial: {e}")
+        logging.getLogger("LYRA").warning(f"Schema type enforcement partial: {e}")
 
     return df[_OUTPUT_COLUMNS]
 
@@ -147,7 +147,7 @@ def _save_results(df: pd.DataFrame,
         project_id     : identifiant du projet
         input_directory: répertoire source à conserver en metadata
     """
-    log = logging.getLogger("NemaCounter.io")
+    log = logging.getLogger("LYRA.io")
 
     # ── globinfo ─────────────────────────────────────────────────────────
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -191,7 +191,7 @@ def draw_detections_yolo_style(img: np.ndarray,
     Returns:
         np.ndarray : image annotée (copie)
     """
-    log = logging.getLogger("NemaCounter.draw")
+    log = logging.getLogger("LYRA.draw")
     overlay = img.copy()
     log.debug(f"Drawing {len(df)} detections")
 
@@ -259,7 +259,7 @@ def process_and_split_masks(results,
     Returns:
         pd.DataFrame
     """
-    log = logging.getLogger("NemaCounter.masks")
+    log = logging.getLogger("LYRA.masks")
     if not results or not results[0].boxes:
         return pd.DataFrame()
 
@@ -427,7 +427,7 @@ def create_project_dirs_structure(outdir: str,
                                    display_overlay: bool = False,
                                    model_task: str = "detect") -> None:
     """Crée l'arborescence de sortie du projet."""
-    log   = logging.getLogger("NemaCounter.io")
+    log   = logging.getLogger("LYRA.io")
     dproj = os.path.join(outdir, project_id)
     if os.path.isdir(dproj):
         log.warning(f"Output dir '{dproj}' already exists — files may be overwritten.")
@@ -439,10 +439,10 @@ def create_project_dirs_structure(outdir: str,
 
 
 # =============================================================================
-#  CLASSE YOLO  —  NemaCounterDetection
+#  CLASSE YOLO  —  LYRADetection
 # =============================================================================
 
-class NemaCounterDetection:
+class LYRADetection:
     """
     Gère le chargement du modèle YOLO, l'inférence, l'averaging temporel
     et les métriques qualité.
@@ -457,7 +457,7 @@ class NemaCounterDetection:
                  device: str = "cpu",
                  use_retina_masks: bool = False,
                  models_dir: str | None = None):
-        self.log = logging.getLogger("NemaCounter.detection")
+        self.log = logging.getLogger("LYRA.detection")
 
         self.device          = device
         self.model           = None
@@ -738,17 +738,17 @@ class NemaCounterDetection:
 
 
 # =============================================================================
-#  CLASSE SAM2  —  NemaCounterSegmentation
+#  CLASSE SAM2  —  LYRASegmentation
 # =============================================================================
 
-class NemaCounterSegmentation:
+class LYRASegmentation:
     """
     Segmentation SAM2 sur des annotations existantes (boxes, polygones, masques).
     Prend en entrée le CSV produit par detection_workflow et raffine les contours.
     """
 
     def __init__(self, device: str = "cpu"):
-        self.log = logging.getLogger("NemaCounter.segmentation")
+        self.log = logging.getLogger("LYRA.segmentation")
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         self.predictor = SAM2ImagePredictor.from_pretrained(
             "facebook/sam2-hiera-large", device=device
@@ -993,7 +993,7 @@ def detection_workflow(dct_args: dict, *,
     use_retina_masks (0|1)
     use_fusion (0|1), fuse_iou_thresh, phagocyte_ioa_thresh
     """
-    log = logging.getLogger("NemaCounter.workflow")
+    log = logging.getLogger("LYRA.workflow")
 
     def _status(msg: str):
         log.info(msg)
@@ -1026,7 +1026,7 @@ def detection_workflow(dct_args: dict, *,
 
     # ── Chargement du modèle ──────────────────────────────────────────────
     _status(f"Loading model on {device}…")
-    model = NemaCounterDetection(
+    model = LYRADetection(
         dct_args["model_path"],
         conf_thresh=float(dct_args["conf_thresh"]),
         iou_thresh=float(dct_args["overlap_thresh"]),
@@ -1190,7 +1190,7 @@ def segmentation_workflow(dct_args: dict, *,
     input_file   : chemin vers le *_globinfo.csv produit par detection_workflow
     gpu (0|1), cpu (int), add_overlay (0|1)
     """
-    log = logging.getLogger("NemaCounter.seg_workflow")
+    log = logging.getLogger("LYRA.seg_workflow")
 
     def _status(msg: str):
         log.info(msg)
@@ -1240,7 +1240,7 @@ def segmentation_workflow(dct_args: dict, *,
 
     # ── Chargement SAM2 ───────────────────────────────────────────────────
     try:
-        seg_model = NemaCounterSegmentation(device=device)
+        seg_model = LYRASegmentation(device=device)
     except Exception as e:
         log.error(f"Cannot load SAM2: {e}")
         return
